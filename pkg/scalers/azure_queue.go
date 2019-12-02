@@ -6,21 +6,20 @@ import (
 	"net/url"
 
 	"github.com/Azure/azure-storage-queue-go/azqueue"
-	log "github.com/Sirupsen/logrus"
 )
 
 // GetAzureQueueLength returns the length of a queue in int
-func GetAzureQueueLength(ctx context.Context, usePodIdentity bool, connectionString, queueName string, accountName string) (int32, error) {
+func GetAzureQueueLength(ctx context.Context, podIdentity string, connectionString, queueName string, accountName string) (int32, error) {
 
 	var credential azqueue.Credential
 	var err error
 
-	if !usePodIdentity {
+	if podIdentity == "" || podIdentity == "none" {
 
 		var accountKey string
 
-		_, accountName, accountKey, _, err := ParseAzureStorageConnectionString(connectionString)
-		
+		_, accountName, accountKey, _, err = ParseAzureStorageConnectionString(connectionString)
+
 		if err != nil {
 			return -1, err
 		}
@@ -29,14 +28,17 @@ func GetAzureQueueLength(ctx context.Context, usePodIdentity bool, connectionStr
 		if err != nil {
 			return -1, err
 		}
-	} else {
-		token, err := getAzureADPodIdentityToken()
+	} else if podIdentity == "azure" {
+		token, err := getAzureADPodIdentityToken("https://storage.azure.com/")
 		if err != nil {
-			log.Printf("Error fetching token cannot determine queue size %s", err.Error())
+			azureQueueLog.Error(err, "Error fetching token cannot determine queue size")
 			return -1, nil
 		}
 
 		credential = azqueue.NewTokenCredential(token.AccessToken, nil)
+	} else {
+		return -1, fmt.Errorf("Azure queues doesn't support %s pod identity type", podIdentity)
+
 	}
 
 	p := azqueue.NewPipeline(credential, azqueue.PipelineOptions{})

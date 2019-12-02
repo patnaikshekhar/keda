@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
+
 	eventhub "github.com/Azure/azure-event-hubs-go"
 	"github.com/Azure/azure-storage-blob-go/azblob"
 )
@@ -148,6 +150,36 @@ func TestGetUnprocessedEventCountInPartition(t *testing.T) {
 	}
 }
 
+const csharpSdkCheckpoint = `{
+		"Epoch": 123456,
+		"Offset": "test offset",
+		"Owner": "test owner",
+		"PartitionId": "test partitionId",
+		"SequenceNumber": 12345
+	}`
+
+const pythonSdkCheckpoint = `{
+		"epoch": 123456,
+		"offset": "test offset",
+		"owner": "test owner",
+		"partition_id": "test partitionId",
+		"sequence_number": 12345
+	}`
+
+func TestGetCheckpoint(t *testing.T) {
+	cckp, err := getCheckpoint([]byte(csharpSdkCheckpoint))
+	if err != nil {
+		t.Error(err)
+	}
+
+	pckp, err := getCheckpoint([]byte(pythonSdkCheckpoint))
+	if err != nil {
+		t.Error(err)
+	}
+
+	assert.Equal(t, cckp, pckp)
+}
+
 func CreateNewCheckpointInStorage(storageAccountName string, credential *azblob.SharedKeyCredential, client *eventhub.Hub) (context.Context, error) {
 	urlPath := fmt.Sprintf("%s.servicebus.windows.net/%s/$Default/", testEventHubNamespace, testEventHubName)
 
@@ -184,8 +216,12 @@ func CreateNewCheckpointInStorage(storageAccountName string, credential *azblob.
 	}
 
 	// Make checkpoint blob files
-	CreatePartitionFile(ctx, urlPath, "0", containerURL, client)
-	CreatePartitionFile(ctx, urlPath, "1", containerURL, client)
+	if err := CreatePartitionFile(ctx, urlPath, "0", containerURL, client); err != nil {
+		return ctx, fmt.Errorf("failed to create partitionID 0 file: %s", err)
+	}
+	if err := CreatePartitionFile(ctx, urlPath, "1", containerURL, client); err != nil {
+		return ctx, fmt.Errorf("failed to create partitionID 1 file: %s", err)
+	}
 
 	return ctx, nil
 }
@@ -219,7 +255,7 @@ func CreatePartitionFile(ctx context.Context, urlPathToPartition string, partiti
 	// Write checkpoints to file
 	file, err := os.Open(partitionID)
 	if err != nil {
-		fmt.Errorf("Unable to create file: %s", err)
+		return fmt.Errorf("Unable to create file: %s", err)
 	}
 	defer file.Close()
 
@@ -230,7 +266,7 @@ func CreatePartitionFile(ctx context.Context, urlPathToPartition string, partiti
 		BlockSize:   4 * 1024 * 1024,
 		Parallelism: 16})
 	if err != nil {
-		fmt.Errorf("Err uploading file to blob: %s", err)
+		return fmt.Errorf("Err uploading file to blob: %s", err)
 	}
 	return nil
 }
@@ -240,7 +276,7 @@ func SendMessageToEventHub(client *eventhub.Hub) error {
 
 	err := client.Send(ctx, eventhub.NewEventFromString("1"))
 	if err != nil {
-		return fmt.Errorf("Error sending msg: %s\n", err)
+		return fmt.Errorf("Error sending msg: %s", err)
 	}
 	return nil
 }

@@ -11,6 +11,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/metrics/pkg/apis/external_metrics"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 const (
@@ -30,9 +31,11 @@ type rabbitMQMetadata struct {
 	queueLength int
 }
 
+var rabbitmqLog = logf.Log.WithName("rabbitmq_scaler")
+
 // NewRabbitMQScaler creates a new rabbitMQ scaler
-func NewRabbitMQScaler(resolvedEnv, metadata map[string]string) (Scaler, error) {
-	meta, err := parseRabbitMQMetadata(metadata)
+func NewRabbitMQScaler(resolvedEnv, metadata, authParams map[string]string) (Scaler, error) {
+	meta, err := parseRabbitMQMetadata(resolvedEnv, metadata, authParams)
 	if err != nil {
 		return nil, fmt.Errorf("error parsing rabbitmq metadata: %s", err)
 	}
@@ -49,13 +52,21 @@ func NewRabbitMQScaler(resolvedEnv, metadata map[string]string) (Scaler, error) 
 	}, nil
 }
 
-func parseRabbitMQMetadata(metadata map[string]string) (*rabbitMQMetadata, error) {
+func parseRabbitMQMetadata(resolvedEnv, metadata, authParams map[string]string) (*rabbitMQMetadata, error) {
 	meta := rabbitMQMetadata{}
 
-	if val, ok := metadata["host"]; ok {
+	if val, ok := authParams["host"]; ok {
 		meta.host = val
-	} else {
-		return nil, fmt.Errorf("no host given")
+	} else if val, ok := metadata["host"]; ok {
+		hostSetting := val
+
+		if val, ok := resolvedEnv[hostSetting]; ok {
+			meta.host = val
+		}
+	}
+
+	if meta.host == "" {
+		return nil, fmt.Errorf("no host setting given")
 	}
 
 	if val, ok := metadata["queueName"]; ok {
@@ -72,7 +83,7 @@ func parseRabbitMQMetadata(metadata map[string]string) (*rabbitMQMetadata, error
 
 		meta.queueLength = queueLength
 	} else {
-		return nil, fmt.Errorf("no queue name given")
+		return nil, fmt.Errorf("no queue length given")
 	}
 
 	return &meta, nil
@@ -96,14 +107,9 @@ func getConnectionAndChannel(host string) (*amqp.Connection, *amqp.Channel, erro
 func (s *rabbitMQScaler) Close() error {
 	err := s.connection.Close()
 	if err != nil {
+		rabbitmqLog.Error(err, "Error closing rabbitmq connection")
 		return err
 	}
-
-	err = s.channel.Close()
-	if err != nil {
-		return err
-	}
-
 	return nil
 }
 

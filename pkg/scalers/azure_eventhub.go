@@ -9,6 +9,8 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/imdario/mergo"
+
 	eventhub "github.com/Azure/azure-event-hubs-go"
 	"github.com/Azure/azure-storage-blob-go/azblob"
 	"github.com/Azure/go-autorest/autorest/azure"
@@ -18,13 +20,27 @@ const (
 	environmentName = "AzurePublicCloud"
 )
 
+type baseCheckpoint struct {
+	Epoch  int64  `json:"Epoch"`
+	Offset string `json:"Offset"`
+	Owner  string `json:"Owner"`
+	Token  string `json:"Token"`
+}
+
+// Checkpoint is the object eventhub processor stores in storage
+// for checkpointing event processors. This matches the object
+// stored by the eventhub C# sdk
 type Checkpoint struct {
-	Epoch          int64  `json:"Epoch"`
-	Offset         string `json:"Offset"`
-	Owner          string `json:"Owner"`
+	baseCheckpoint
 	PartitionID    string `json:"PartitionId"`
 	SequenceNumber int64  `json:"SequenceNumber"`
-	Token          string `json:"Token"`
+}
+
+// Eventhub python sdk stores the checkpoint differently
+type pythonCheckpoint struct {
+	baseCheckpoint
+	PartitionID    string `json:"partition_id"`
+	SequenceNumber int64  `json:"sequence_number"`
 }
 
 // GetStorageCredentials returns azure env and storage credentials
@@ -87,22 +103,34 @@ func GetCheckpointFromBlobStorage(ctx context.Context, partitionID string, event
 
 	blobData := &bytes.Buffer{}
 	reader := get.Body(azblob.RetryReaderOptions{})
-	blobData.ReadFrom(reader)
+	if _, err := blobData.ReadFrom(reader); err != nil {
+		return Checkpoint{}, fmt.Errorf("failed to read blob data: %s", err)
+	}
 	defer reader.Close() // The client must close the response body when finished with it
 
-	var dat Checkpoint
+	return getCheckpoint(blobData.Bytes())
+}
 
-	if err := json.Unmarshal(blobData.Bytes(), &dat); err != nil {
+func getCheckpoint(bytes []byte) (Checkpoint, error) {
+	var checkpoint Checkpoint
+	var pyCheckpoint pythonCheckpoint
+
+	if err := json.Unmarshal(bytes, &checkpoint); err != nil {
 		return Checkpoint{}, fmt.Errorf("failed to decode blob data: %s", err)
 	}
 
-	return dat, nil
+	if err := json.Unmarshal(bytes, &pyCheckpoint); err != nil {
+		return Checkpoint{}, fmt.Errorf("failed to decode blob data: %s", err)
+	}
+
+	err := mergo.Merge(&checkpoint, Checkpoint(pyCheckpoint))
+
+	return checkpoint, err
 }
 
-/* ParseAzureEventHubConnectionString parses Event Hub connection string into (namespace, name)
-   Connection string should be in following format:
-   Endpoint=sb://eventhub-namespace.servicebus.windows.net/;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=secretKey123;EntityPath=eventhub-name
-*/
+// ParseAzureEventHubConnectionString parses Event Hub connection string into (namespace, name)
+// Connection string should be in following format:
+// Endpoint=sb://eventhub-namespace.servicebus.windows.net/;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=secretKey123;EntityPath=eventhub-name
 func ParseAzureEventHubConnectionString(connectionString string) (string, string, error) {
 	parts := strings.Split(connectionString, ";")
 

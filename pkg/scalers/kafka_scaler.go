@@ -2,25 +2,26 @@ package scalers
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"strconv"
 	"strings"
 
 	"github.com/Shopify/sarama"
-	log "github.com/Sirupsen/logrus"
 	v2beta1 "k8s.io/api/autoscaling/v2beta1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/metrics/pkg/apis/external_metrics"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 type kafkaScaler struct {
-	resolvedSecrets map[string]string
-	metadata        kafkaMetadata
-	client          sarama.Client
-	admin           sarama.ClusterAdmin
+	metadata kafkaMetadata
+	client   sarama.Client
+	admin    sarama.ClusterAdmin
 }
 
 type kafkaMetadata struct {
@@ -28,7 +29,27 @@ type kafkaMetadata struct {
 	group        string
 	topic        string
 	lagThreshold int64
+
+	// auth
+	authMode kafkaAuthMode
+	username string
+	password string
+
+	// ssl
+	cert string
+	key  string
+	ca   string
 }
+
+type kafkaAuthMode string
+
+const (
+	kafkaAuthModeForNone            kafkaAuthMode = "none"
+	kafkaAuthModeForSaslPlaintext   kafkaAuthMode = "sasl_plaintext"
+	kafkaAuthModeForSaslScramSha256 kafkaAuthMode = "sasl_scram_sha256"
+	kafkaAuthModeForSaslScramSha512 kafkaAuthMode = "sasl_scram_sha512"
+	kafkaAuthModeForSaslSSL         kafkaAuthMode = "sasl_ssl"
+)
 
 const (
 	lagThresholdMetricName   = "lagThreshold"
@@ -36,9 +57,11 @@ const (
 	defaultKafkaLagThreshold = 10
 )
 
+var kafkaLog = logf.Log.WithName("kafka_scaler")
+
 // NewKafkaScaler creates a new kafkaScaler
-func NewKafkaScaler(resolvedSecrets, metadata map[string]string) (Scaler, error) {
-	kafkaMetadata, err := parseKafkaMetadata(metadata)
+func NewKafkaScaler(resolvedEnv, metadata, authParams map[string]string) (Scaler, error) {
+	kafkaMetadata, err := parseKafkaMetadata(resolvedEnv, metadata, authParams)
 	if err != nil {
 		return nil, fmt.Errorf("error parsing kafka metadata: %s", err)
 	}
@@ -49,14 +72,13 @@ func NewKafkaScaler(resolvedSecrets, metadata map[string]string) (Scaler, error)
 	}
 
 	return &kafkaScaler{
-		client:          client,
-		admin:           admin,
-		metadata:        kafkaMetadata,
-		resolvedSecrets: resolvedSecrets,
+		client:   client,
+		admin:    admin,
+		metadata: kafkaMetadata,
 	}, nil
 }
 
-func parseKafkaMetadata(metadata map[string]string) (kafkaMetadata, error) {
+func parseKafkaMetadata(resolvedEnv, metadata, authParams map[string]string) (kafkaMetadata, error) {
 	meta := kafkaMetadata{}
 
 	if metadata["brokerList"] == "" {
@@ -84,6 +106,45 @@ func parseKafkaMetadata(metadata map[string]string) (kafkaMetadata, error) {
 		meta.lagThreshold = t
 	}
 
+	meta.authMode = kafkaAuthModeForNone
+	if val, ok := authParams["authMode"]; ok {
+		mode := kafkaAuthMode(val)
+		if mode != kafkaAuthModeForNone && mode != kafkaAuthModeForSaslPlaintext && mode != kafkaAuthModeForSaslSSL && mode != kafkaAuthModeForSaslScramSha256 && mode != kafkaAuthModeForSaslScramSha512 {
+			return meta, fmt.Errorf("err auth mode %s given", mode)
+		}
+
+		meta.authMode = mode
+	}
+
+	if meta.authMode != kafkaAuthModeForNone {
+		if authParams["username"] == "" {
+			return meta, errors.New("no username given")
+		}
+		meta.username = authParams["username"]
+
+		if authParams["password"] == "" {
+			return meta, errors.New("no password given")
+		}
+		meta.password = authParams["password"]
+	}
+
+	if meta.authMode == kafkaAuthModeForSaslSSL {
+		if authParams["ca"] == "" {
+			return meta, errors.New("no ca given")
+		}
+		meta.ca = authParams["ca"]
+
+		if authParams["cert"] == "" {
+			return meta, errors.New("no cert given")
+		}
+		meta.cert = authParams["cert"]
+
+		if authParams["key"] == "" {
+			return meta, errors.New("no key given")
+		}
+		meta.key = authParams["key"]
+	}
+
 	return meta, nil
 }
 
@@ -101,7 +162,7 @@ func (s *kafkaScaler) IsActive(ctx context.Context) (bool, error) {
 
 	for _, partition := range partitions {
 		lag := s.getLagForPartition(partition, offsets)
-		log.Debugf("Group %s has a lag of %d for topic %s and partition %d\n", s.metadata.group, lag, s.metadata.topic, partition)
+		kafkaLog.V(1).Info(fmt.Sprintf("Group %s has a lag of %d for topic %s and partition %d\n", s.metadata.group, lag, s.metadata.topic, partition))
 
 		// Return as soon as a lag was detected for any partition
 		if lag > 0 {
@@ -115,6 +176,40 @@ func (s *kafkaScaler) IsActive(ctx context.Context) (bool, error) {
 func getKafkaClients(metadata kafkaMetadata) (sarama.Client, sarama.ClusterAdmin, error) {
 	config := sarama.NewConfig()
 	config.Version = sarama.V1_0_0_0
+
+	if ok := metadata.authMode == kafkaAuthModeForSaslPlaintext || metadata.authMode == kafkaAuthModeForSaslSSL || metadata.authMode == kafkaAuthModeForSaslScramSha256 || metadata.authMode == kafkaAuthModeForSaslScramSha512; ok {
+		config.Net.SASL.Enable = true
+		config.Net.SASL.User = metadata.username
+		config.Net.SASL.Password = metadata.password
+	}
+
+	if metadata.authMode == kafkaAuthModeForSaslSSL {
+		cert, err := tls.X509KeyPair([]byte(metadata.cert), []byte(metadata.key))
+		if err != nil {
+			return nil, nil, fmt.Errorf("error parse X509KeyPair: %s", err)
+		}
+
+		caCertPool := x509.NewCertPool()
+		caCertPool.AppendCertsFromPEM([]byte(metadata.ca))
+
+		tlsConfig := &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			RootCAs:      caCertPool,
+		}
+
+		config.Net.TLS.Enable = true
+		config.Net.TLS.Config = tlsConfig
+	}
+
+	if metadata.authMode == kafkaAuthModeForSaslScramSha256 {
+		config.Net.SASL.SCRAMClientGeneratorFunc = func() sarama.SCRAMClient { return &XDGSCRAMClient{HashGeneratorFcn: SHA256} }
+		config.Net.SASL.Mechanism = sarama.SASLMechanism(sarama.SASLTypeSCRAMSHA256)
+	}
+
+	if metadata.authMode == kafkaAuthModeForSaslScramSha512 {
+		config.Net.SASL.SCRAMClientGeneratorFunc = func() sarama.SCRAMClient { return &XDGSCRAMClient{HashGeneratorFcn: SHA512} }
+		config.Net.SASL.Mechanism = sarama.SASLMechanism(sarama.SASLTypeSCRAMSHA512)
+	}
 
 	client, err := sarama.NewClient(metadata.brokers, config)
 	if err != nil {
@@ -164,7 +259,7 @@ func (s *kafkaScaler) getLagForPartition(partition int32, offsets *sarama.Offset
 	consumerOffset := block.Offset
 	latestOffset, err := s.client.GetOffset(s.metadata.topic, partition, sarama.OffsetNewest)
 	if err != nil {
-		log.Errorf("error finding latest offset for topic %s and partition %d\n", s.metadata.topic, partition)
+		kafkaLog.Error(err, fmt.Sprintf("error finding latest offset for topic %s and partition %d\n", s.metadata.topic, partition))
 		return 0
 	}
 
@@ -225,7 +320,7 @@ func (s *kafkaScaler) GetMetrics(ctx context.Context, metricName string, metricS
 		totalLag += lag
 	}
 
-	log.Debugf("Kafka scaler: Providing metrics based on totalLag %v, partitions %v, threshold %v", totalLag, len(partitions), s.metadata.lagThreshold)
+	kafkaLog.V(1).Info(fmt.Sprintf("Kafka scaler: Providing metrics based on totalLag %v, partitions %v, threshold %v", totalLag, len(partitions), s.metadata.lagThreshold))
 
 	// don't scale out beyond the number of partitions
 	if (totalLag / s.metadata.lagThreshold) > int64(len(partitions)) {
